@@ -1,0 +1,8 @@
+diffusers["torch"]
+transformers
+sentencepiece
+gdown
+git+https://github.com/openai/CLIP.git
+bitsandbytes
+matplotlib
+protobuf

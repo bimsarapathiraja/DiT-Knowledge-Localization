@@ -1,0 +1,7 @@
+.venv
+__pycache__
+pretrained_models
+results/
+logs/
+test_notebooks/
+results_notebooks/
