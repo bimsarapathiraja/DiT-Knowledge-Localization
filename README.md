@@ -1,10 +1,10 @@
 # Localizing Knowledge in Diffusion Transformers
 
-🌐 [Project](https://armanzarei.github.io/Localizing-Knowledge-in-DiTs/) &nbsp;$|$ 📄 [ArXiv](https://arxiv.org/abs/2505.18832)
+🌐 [Project](https://armanzarei.github.io/Localizing-Knowledge-in-DiTs/) &nbsp;| 📄 [ArXiv](https://arxiv.org/abs/2505.18832)
 
 ## 🔎 Localization and Intervention
 
-Run localization on the $\mathcal{L}oc\mathcal{K}$ dataset and generate samples with intervention:
+Run localization on the 𝓛oc𝓚 dataset and generate samples with intervention:
 
 ```bash
 python localization_and_intervention/localize_knowledge_and_intervene.py \
@@ -101,7 +101,7 @@ Remove `--eval_single_artist_directory` to evaluate each artist's directory in t
 
 ## 🗂️ Dataset
 
-Please refer to the `dataset/` folder for the $\mathcal{L}oc\mathcal{K}$ dataset, which includes all knowledge categories along with their corresponding prompts for localization. You can also use the data classes defined in `dataset.py` to load and work with the dataset.
+Please refer to the `dataset/` folder for the 𝓛oc𝓚 dataset, which includes all knowledge categories along with their corresponding prompts for localization. You can also use the data classes defined in `dataset.py` to load and work with the dataset.
 
 ## Citation
 
