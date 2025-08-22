@@ -1,22 +1,24 @@
-import inspect
-from typing import Callable, List, Optional, Dict, Union, Any
+# Import required modules for custom Flux pipeline implementation
+import inspect                      # For function signature inspection
+from typing import Callable, List, Optional, Dict, Union, Any  # Type hints for better code documentation
 
-import numpy as np
-import torch
+import numpy as np                  # Numerical operations for timestep scheduling
+import torch                        # PyTorch tensor operations
 
-from diffusers import FluxPipeline
-from diffusers.pipelines.flux import FluxPipelineOutput
-from diffusers.utils import is_torch_xla_available
-from diffusers.image_processor import PipelineImageInput
+# Import Diffusers components for Flux pipeline
+from diffusers import FluxPipeline                    # Base Flux pipeline class
+from diffusers.pipelines.flux import FluxPipelineOutput  # Standard output format
+from diffusers.utils import is_torch_xla_available   # Check for TPU availability
+from diffusers.image_processor import PipelineImageInput  # Input image type hint
 
+# Add parent directory to path for importing custom attention processors
 import sys
 sys.path.append("..")
-from attention_processor import FluxEmbeddingModifierAttnProcessor
+from attention_processor import FluxEmbeddingModifierAttnProcessor  # Custom attention processor for intervention
 
-
+# Handle optional TPU support
 if is_torch_xla_available():
-    import torch_xla.core.xla_model as xm
-
+    import torch_xla.core.xla_model as xm  # TPU operations
     XLA_AVAILABLE = True
 else:
     XLA_AVAILABLE = False
@@ -29,9 +31,27 @@ def calculate_shift(
     base_shift: float = 0.5,
     max_shift: float = 1.16,
 ):
-    m = (max_shift - base_shift) / (max_seq_len - base_seq_len)
-    b = base_shift - m * base_seq_len
-    mu = image_seq_len * m + b
+    """
+    Calculate timestep shift parameter for Flux model based on image sequence length.
+    
+    Flux uses a timestep shift mechanism to adapt the diffusion schedule based on
+    the complexity of the image (measured by sequence length). Longer sequences
+    require different noise schedules for optimal generation quality.
+    
+    Args:
+        image_seq_len: Length of the image token sequence after patchification
+        base_seq_len: Minimum sequence length for shift calculation (default: 256)
+        max_seq_len: Maximum sequence length for shift calculation (default: 4096)  
+        base_shift: Shift value for minimum sequence length (default: 0.5)
+        max_shift: Shift value for maximum sequence length (default: 1.16)
+        
+    Returns:
+        float: Calculated shift parameter for timestep scheduling
+    """
+    # Linear interpolation between base_shift and max_shift based on sequence length
+    m = (max_shift - base_shift) / (max_seq_len - base_seq_len)  # Slope of linear function
+    b = base_shift - m * base_seq_len                           # Y-intercept
+    mu = image_seq_len * m + b                                  # Final shift value
     return mu
 
 
@@ -43,60 +63,136 @@ def retrieve_timesteps(
     sigmas: Optional[List[float]] = None,
     **kwargs,
 ):
+    """
+    Retrieve and configure timesteps for the diffusion process.
+    
+    This function handles different ways of specifying the diffusion schedule:
+    either through number of steps, explicit timesteps, or sigma values.
+    It validates the scheduler compatibility and sets up the timestep schedule.
+    
+    Args:
+        scheduler: The diffusion scheduler to configure
+        num_inference_steps: Number of denoising steps to perform
+        device: Device to place timesteps tensor on
+        timesteps: Explicit list of timestep values (overrides num_inference_steps)
+        sigmas: Explicit list of noise sigma values (overrides other parameters)
+        **kwargs: Additional arguments passed to scheduler.set_timesteps()
+        
+    Returns:
+        tuple: (timesteps tensor, actual number of inference steps)
+        
+    Raises:
+        ValueError: If both timesteps and sigmas are provided, or scheduler doesn't support them
+    """
+    # Validate that only one timestep specification method is used
     if timesteps is not None and sigmas is not None:
         raise ValueError("Only one of `timesteps` or `sigmas` can be passed. Please choose one to set custom values")
+    
     if timesteps is not None:
+        # Use explicit timesteps if provided
+        # Check if the scheduler supports custom timestep schedules
         accepts_timesteps = "timesteps" in set(inspect.signature(scheduler.set_timesteps).parameters.keys())
         if not accepts_timesteps:
             raise ValueError(
                 f"The current scheduler class {scheduler.__class__}'s `set_timesteps` does not support custom"
                 f" timestep schedules. Please check whether you are using the correct scheduler."
             )
+        # Configure scheduler with custom timesteps
         scheduler.set_timesteps(timesteps=timesteps, device=device, **kwargs)
-        timesteps = scheduler.timesteps
-        num_inference_steps = len(timesteps)
+        timesteps = scheduler.timesteps          # Get the configured timesteps
+        num_inference_steps = len(timesteps)     # Update step count to match timesteps
+        
     elif sigmas is not None:
+        # Use explicit sigma values if provided
+        # Check if the scheduler supports custom sigma schedules  
         accept_sigmas = "sigmas" in set(inspect.signature(scheduler.set_timesteps).parameters.keys())
         if not accept_sigmas:
             raise ValueError(
                 f"The current scheduler class {scheduler.__class__}'s `set_timesteps` does not support custom"
                 f" sigmas schedules. Please check whether you are using the correct scheduler."
             )
+        # Configure scheduler with custom sigmas
         scheduler.set_timesteps(sigmas=sigmas, device=device, **kwargs)
-        timesteps = scheduler.timesteps
-        num_inference_steps = len(timesteps)
+        timesteps = scheduler.timesteps          # Get timesteps corresponding to sigmas
+        num_inference_steps = len(timesteps)     # Update step count
+        
     else:
+        # Use standard number of inference steps (most common case)
         scheduler.set_timesteps(num_inference_steps, device=device, **kwargs)
-        timesteps = scheduler.timesteps
+        timesteps = scheduler.timesteps          # Get the standard timestep schedule
+        
     return timesteps, num_inference_steps
 
 
 class CustomFluxPipeline(FluxPipeline):
+    """
+    Extended Flux pipeline with knowledge intervention capabilities.
+    
+    This custom pipeline extends the standard FluxPipeline to support knowledge localization
+    and intervention experiments. It adds the ability to:
+    1. Use "clean" embeddings (without target knowledge) during generation
+    2. Selectively modify attention in specific transformer blocks
+    3. Generate both original and intervention images for comparison
+    """
+    
     def set_clean_scheduler(self):
         """
-        Set the scheduler to the clean one
+        Create a copy of the main scheduler for processing "clean" embeddings.
+        
+        During knowledge intervention, we need to run two parallel diffusion processes:
+        one with original embeddings and one with clean embeddings. This method
+        creates an independent scheduler copy for the clean path.
         """
-        # Clone self.scheduler to self.clean_scheduler
+        # Clone the main scheduler configuration to create an independent copy
         self.clean_scheduler = self.scheduler.__class__.from_config(self.scheduler.config)
     
     def set_embedding_modifier_attn_processor(self):
+        """
+        Install embedding modifier attention processors on all transformer blocks.
+        
+        This method replaces the standard attention processors with custom ones that
+        can save and replace encoder hidden states for knowledge intervention.
+        """
+        # Install custom processors on multi-modal transformer blocks
         for block in self.transformer.transformer_blocks:
             block.attn.set_processor(FluxEmbeddingModifierAttnProcessor())
     
+        # Install custom processors on single transformer blocks  
         for block in self.transformer.single_transformer_blocks:
             block.attn.set_processor(FluxEmbeddingModifierAttnProcessor())
 
     def change_attn_embedding_modifier_mode(self, mm_attn_embedding_modifier_indices, single_attn_embedding_modifier_indices, mode):
+        """
+        Change the processing mode for specific attention processors during intervention.
+        
+        This method switches between saving clean embeddings and using them for replacement
+        in the identified dominant blocks.
+        
+        Args:
+            mm_attn_embedding_modifier_indices: Multi-modal block indices to modify
+            single_attn_embedding_modifier_indices: Single transformer block indices to modify  
+            mode: ProcessorMode (SAVE_ENCODER_HIDDEN_STATES or REPLACE_ENCODER_HIDDEN_STATES)
+        """
+        # Set mode for specified multi-modal transformer blocks
         for idx in mm_attn_embedding_modifier_indices:
             self.transformer.transformer_blocks[idx].attn.processor.mode = mode
 
+        # Set mode for specified single transformer blocks
         for idx in single_attn_embedding_modifier_indices:
             self.transformer.single_transformer_blocks[idx].attn.processor.mode = mode
     
     def clear_attn_embedding_modifier_processors_cache(self):
+        """
+        Clear cached encoder hidden states from all embedding modifier processors.
+        
+        This frees memory after knowledge intervention is complete by removing
+        stored clean embeddings from all attention processors.
+        """
+        # Clear cache from multi-modal transformer blocks
         for block in self.transformer.transformer_blocks:
             block.attn.processor.clear_cache()
         
+        # Clear cache from single transformer blocks
         for block in self.transformer.single_transformer_blocks:
             block.attn.processor.clear_cache()
         
