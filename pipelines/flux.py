@@ -199,136 +199,179 @@ class CustomFluxPipeline(FluxPipeline):
     @torch.no_grad()
     def __call__(
         self,
-        prompt: Union[str, List[str]] = None,
-        prompt_2: Optional[Union[str, List[str]]] = None,
-        negative_prompt: Union[str, List[str]] = None,
-        negative_prompt_2: Optional[Union[str, List[str]]] = None,
-        true_cfg_scale: float = 1.0,
-        height: Optional[int] = 512, # Changed
-        width: Optional[int] = 512, # Changed
-        num_inference_steps: int = 28,
-        sigmas: Optional[List[float]] = None,
-        guidance_scale: float = 3.5,
-        num_images_per_prompt: Optional[int] = 1,
-        generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
-        latents: Optional[torch.FloatTensor] = None,
-        prompt_embeds: Optional[torch.FloatTensor] = None,
-        pooled_prompt_embeds: Optional[torch.FloatTensor] = None,
-        ip_adapter_image: Optional[PipelineImageInput] = None,
-        ip_adapter_image_embeds: Optional[List[torch.Tensor]] = None,
-        negative_ip_adapter_image: Optional[PipelineImageInput] = None,
-        negative_ip_adapter_image_embeds: Optional[List[torch.Tensor]] = None,
-        negative_prompt_embeds: Optional[torch.FloatTensor] = None,
-        negative_pooled_prompt_embeds: Optional[torch.FloatTensor] = None,
-        output_type: Optional[str] = "pil",
-        return_dict: bool = True,
-        joint_attention_kwargs: Optional[Dict[str, Any]] = None,
-        callback_on_step_end: Optional[Callable[[int, int, Dict], None]] = None,
-        callback_on_step_end_tensor_inputs: List[str] = ["latents"],
-        max_sequence_length: int = 512,
-        # Added parameters
-        clean_prompt: Union[str, List[str]] = None,
-        mm_attn_embedding_modifier_indices: Optional[List[int]] = None,
-        single_attn_embedding_modifier_indices: Optional[List[int]] = None,
-        replace_pooled_prompt_embeds: bool = False,
-        return_clean_image: bool = False,
+        # Standard Flux pipeline parameters
+        prompt: Union[str, List[str]] = None,                              # Text prompt(s) for image generation  
+        prompt_2: Optional[Union[str, List[str]]] = None,                 # Secondary prompts (unused in current implementation)
+        negative_prompt: Union[str, List[str]] = None,                     # Negative prompt(s) to avoid certain content
+        negative_prompt_2: Optional[Union[str, List[str]]] = None,        # Secondary negative prompts
+        true_cfg_scale: float = 1.0,                                      # True classifier-free guidance scale
+        height: Optional[int] = 512,                                      # Generated image height (changed from default)
+        width: Optional[int] = 512,                                       # Generated image width (changed from default)
+        num_inference_steps: int = 28,                                    # Number of diffusion denoising steps
+        sigmas: Optional[List[float]] = None,                             # Custom noise schedule (overrides num_inference_steps)
+        guidance_scale: float = 3.5,                                      # Classifier-free guidance strength
+        num_images_per_prompt: Optional[int] = 1,                         # Number of images to generate per prompt
+        generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,  # Random number generator for reproducibility
+        latents: Optional[torch.FloatTensor] = None,                      # Pre-computed initial noise (optional)
+        prompt_embeds: Optional[torch.FloatTensor] = None,                # Pre-computed prompt embeddings (optional)
+        pooled_prompt_embeds: Optional[torch.FloatTensor] = None,         # Pre-computed pooled prompt embeddings (optional)
+        ip_adapter_image: Optional[PipelineImageInput] = None,            # Input image for IP-Adapter conditioning
+        ip_adapter_image_embeds: Optional[List[torch.Tensor]] = None,     # Pre-computed IP-Adapter image embeddings
+        negative_ip_adapter_image: Optional[PipelineImageInput] = None,   # Negative IP-Adapter conditioning image
+        negative_ip_adapter_image_embeds: Optional[List[torch.Tensor]] = None,  # Negative IP-Adapter embeddings
+        negative_prompt_embeds: Optional[torch.FloatTensor] = None,       # Pre-computed negative prompt embeddings
+        negative_pooled_prompt_embeds: Optional[torch.FloatTensor] = None,  # Pre-computed negative pooled embeddings
+        output_type: Optional[str] = "pil",                               # Output format ("pil", "latent", etc.)
+        return_dict: bool = True,                                         # Whether to return FluxPipelineOutput object
+        joint_attention_kwargs: Optional[Dict[str, Any]] = None,          # Additional attention parameters
+        callback_on_step_end: Optional[Callable[[int, int, Dict], None]] = None,  # Callback function after each step
+        callback_on_step_end_tensor_inputs: List[str] = ["latents"],      # Tensors to pass to callback
+        max_sequence_length: int = 512,                                   # Maximum text sequence length
+        
+        # Custom parameters for knowledge intervention
+        clean_prompt: Union[str, List[str]] = None,                       # "Clean" prompt without target knowledge
+        mm_attn_embedding_modifier_indices: Optional[List[int]] = None,   # Multi-modal blocks to modify for intervention
+        single_attn_embedding_modifier_indices: Optional[List[int]] = None,  # Single blocks to modify for intervention
+        replace_pooled_prompt_embeds: bool = False,                       # Use clean prompt's pooled embeddings
+        return_clean_image: bool = False,                                 # Return both original and clean images
     ):
+        """
+        Generate images with optional knowledge intervention capabilities.
+        
+        This extended __call__ method supports standard Flux generation plus knowledge
+        intervention. It can generate images with specific knowledge removed or modified
+        by replacing encoder hidden states in identified dominant transformer blocks.
+        
+        The intervention process works in two phases:
+        1. "Clean" pass: Generate with clean prompt and save encoder states
+        2. "Intervention" pass: Generate with original prompt but replace encoder states
+           in dominant blocks with clean states
+        
+        Returns:
+            Union[FluxPipelineOutput, Tuple]: Generated images, optionally with clean comparison
+        """
+        # Set default image dimensions if not provided
         height = height or self.default_sample_size * self.vae_scale_factor
         width = width or self.default_sample_size * self.vae_scale_factor
 
-        # 1. Check inputs. Raise error if not correct
+        # Step 1: Validate all input parameters to ensure they're compatible
         self.check_inputs(
-            prompt,
-            prompt_2,
-            height,
-            width,
-            negative_prompt=negative_prompt,
-            negative_prompt_2=negative_prompt_2,
-            prompt_embeds=prompt_embeds,
-            negative_prompt_embeds=negative_prompt_embeds,
-            pooled_prompt_embeds=pooled_prompt_embeds,
-            negative_pooled_prompt_embeds=negative_pooled_prompt_embeds,
-            callback_on_step_end_tensor_inputs=callback_on_step_end_tensor_inputs,
-            max_sequence_length=max_sequence_length,
+            prompt,                                    # Primary prompt validation
+            prompt_2,                                  # Secondary prompt validation  
+            height,                                    # Image height validation
+            width,                                     # Image width validation
+            negative_prompt=negative_prompt,           # Negative prompt validation
+            negative_prompt_2=negative_prompt_2,       # Secondary negative prompt validation
+            prompt_embeds=prompt_embeds,               # Pre-computed embeddings validation
+            negative_prompt_embeds=negative_prompt_embeds,  # Negative embeddings validation
+            pooled_prompt_embeds=pooled_prompt_embeds,      # Pooled embeddings validation
+            negative_pooled_prompt_embeds=negative_pooled_prompt_embeds,  # Negative pooled validation
+            callback_on_step_end_tensor_inputs=callback_on_step_end_tensor_inputs,  # Callback inputs validation
+            max_sequence_length=max_sequence_length,   # Text sequence length validation
         )
 
-        assert (mm_attn_embedding_modifier_indices is None) == (single_attn_embedding_modifier_indices is None), "If you want to use mm and single attn embedding modifier indices, please provide both or none"
+        # Validate intervention parameters - both must be provided together or not at all
+        assert (mm_attn_embedding_modifier_indices is None) == (single_attn_embedding_modifier_indices is None), \
+            "If you want to use mm and single attn embedding modifier indices, please provide both or none"
         
+        # Validate intervention indices are within valid ranges
         if mm_attn_embedding_modifier_indices is not None:
-            assert len(mm_attn_embedding_modifier_indices) >= 0 and all([0 <= i < len(self.transformer.transformer_blocks) for i in mm_attn_embedding_modifier_indices])
-            assert len(single_attn_embedding_modifier_indices) >= 0 and all([0 <= i < len(self.transformer.single_transformer_blocks) for i in single_attn_embedding_modifier_indices])
+            assert len(mm_attn_embedding_modifier_indices) >= 0 and \
+                   all([0 <= i < len(self.transformer.transformer_blocks) for i in mm_attn_embedding_modifier_indices]), \
+                   "Multi-modal attention embedding modifier indices must be within transformer_blocks range"
+            assert len(single_attn_embedding_modifier_indices) >= 0 and \
+                   all([0 <= i < len(self.transformer.single_transformer_blocks) for i in single_attn_embedding_modifier_indices]), \
+                   "Single attention embedding modifier indices must be within single_transformer_blocks range"
             assert clean_prompt is not None, "If you want to use clean pass, please provide a clean prompt"
-        
 
-        self._guidance_scale = guidance_scale
-        self._joint_attention_kwargs = joint_attention_kwargs
-        self._interrupt = False
+        # Store pipeline configuration parameters
+        self._guidance_scale = guidance_scale              # Classifier-free guidance strength
+        self._joint_attention_kwargs = joint_attention_kwargs  # Additional attention parameters
+        self._interrupt = False                           # Flag for interrupting generation mid-process
 
-        # 2. Define call parameters
+        # Step 2: Determine batch size from prompt or pre-computed embeddings
         if prompt is not None and isinstance(prompt, str):
-            batch_size = 1
+            batch_size = 1                               # Single string prompt
         elif prompt is not None and isinstance(prompt, list):
-            batch_size = len(prompt)
+            batch_size = len(prompt)                     # List of prompts
         else:
-            batch_size = prompt_embeds.shape[0]
+            batch_size = prompt_embeds.shape[0]          # Use embedding batch size
 
+        # Set device for tensor operations (typically CUDA for GPU acceleration)
         device = self._execution_device
 
+        # Extract LoRA (Low-Rank Adaptation) scale if using fine-tuned models
         lora_scale = (
             self.joint_attention_kwargs.get("scale", None) if self.joint_attention_kwargs is not None else None
         )
+        
+        # Determine if true classifier-free guidance is needed (requires negative prompts)
         do_true_cfg = true_cfg_scale > 1 and negative_prompt is not None
+        
+        # Step 3: Encode the main prompt into embeddings
+        # This converts text into the tensor representations used by the transformer
         (
-            prompt_embeds,
-            pooled_prompt_embeds,
-            text_ids,
+            prompt_embeds,           # Text token embeddings [batch, seq_len, dim]
+            pooled_prompt_embeds,    # Pooled/aggregated text representation [batch, dim]
+            text_ids,                # Token position IDs for attention
         ) = self.encode_prompt(
-            prompt=prompt,
-            prompt_2=prompt_2,
-            prompt_embeds=prompt_embeds,
-            pooled_prompt_embeds=pooled_prompt_embeds,
-            device=device,
-            num_images_per_prompt=num_images_per_prompt,
-            max_sequence_length=max_sequence_length,
-            lora_scale=lora_scale,
+            prompt=prompt,                              # Input text prompt
+            prompt_2=prompt_2,                          # Secondary prompt (unused)
+            prompt_embeds=prompt_embeds,                # Use pre-computed embeddings if provided
+            pooled_prompt_embeds=pooled_prompt_embeds,  # Use pre-computed pooled embeddings if provided
+            device=device,                              # Target device for embeddings
+            num_images_per_prompt=num_images_per_prompt,  # Repeat embeddings for multiple images
+            max_sequence_length=max_sequence_length,    # Maximum text length
+            lora_scale=lora_scale,                      # LoRA scaling factor
         )
+        
+        # Encode negative prompt if using classifier-free guidance
         if do_true_cfg:
             (
-                negative_prompt_embeds,
-                negative_pooled_prompt_embeds,
-                _,
+                negative_prompt_embeds,        # Negative text embeddings
+                negative_pooled_prompt_embeds, # Negative pooled embeddings  
+                _,                             # Text IDs (same as positive, discarded)
             ) = self.encode_prompt(
-                prompt=negative_prompt,
-                prompt_2=negative_prompt_2,
-                prompt_embeds=negative_prompt_embeds,
-                pooled_prompt_embeds=negative_pooled_prompt_embeds,
-                device=device,
-                num_images_per_prompt=num_images_per_prompt,
-                max_sequence_length=max_sequence_length,
-                lora_scale=lora_scale,
+                prompt=negative_prompt,                          # Negative prompt text
+                prompt_2=negative_prompt_2,                      # Secondary negative prompt
+                prompt_embeds=negative_prompt_embeds,            # Pre-computed negative embeddings
+                pooled_prompt_embeds=negative_pooled_prompt_embeds,  # Pre-computed negative pooled
+                device=device,                                   # Target device
+                num_images_per_prompt=num_images_per_prompt,     # Batch replication
+                max_sequence_length=max_sequence_length,         # Text length limit
+                lora_scale=lora_scale,                          # LoRA scaling
             )
         
-        do_clean_pass = mm_attn_embedding_modifier_indices is not None
+        # Step 4: Set up knowledge intervention if parameters are provided
+        do_clean_pass = mm_attn_embedding_modifier_indices is not None  # Enable intervention mode
+        
+        # Validate clean image return requirements
         if return_clean_image:
             assert do_clean_pass, "If you want to return clean image, please provide a clean prompt and mm_attn_embedding_modifier_indices"
+        
+        # Configure intervention system if needed
         if do_clean_pass:
+            # Install custom attention processors that can save/replace encoder states
             self.set_embedding_modifier_attn_processor()
         
+            # Encode the "clean" prompt (without target knowledge)
             (
-                clean_prompt_embeds,
-                clean_pooled_prompt_embeds,
-                text_ids,
+                clean_prompt_embeds,        # Clean text embeddings without target knowledge
+                clean_pooled_prompt_embeds, # Clean pooled embeddings
+                text_ids,                   # Position IDs (reused)
             ) = self.encode_prompt(
-                prompt=clean_prompt,
-                prompt_2=None,
-                device=device,
-                num_images_per_prompt=num_images_per_prompt,
-                max_sequence_length=max_sequence_length,
-                lora_scale=lora_scale,
+                prompt=clean_prompt,                        # Clean prompt without target knowledge
+                prompt_2=None,                              # No secondary clean prompt
+                device=device,                              # Target device
+                num_images_per_prompt=num_images_per_prompt,  # Batch size
+                max_sequence_length=max_sequence_length,    # Text length limit
+                lora_scale=lora_scale,                      # LoRA scaling
             )
 
+            # Optionally use clean prompt's pooled embeddings for the main generation
             if replace_pooled_prompt_embeds:
                 pooled_prompt_embeds = clean_pooled_prompt_embeds
+            # Note: Could also replace prompt_embeds here, but currently commented out
             # prompt_embeds = clean_prompt_embeds
             
         # 4. Prepare latent variables
@@ -540,3 +583,86 @@ class CustomFluxPipeline(FluxPipeline):
             return (image,)
 
         return FluxPipelineOutput(images=image)
+
+"""
+=== KNOWLEDGE LOCALIZATION IN FLUX TRANSFORMERS: COMPLETE WORKFLOW ===
+
+This file implements a comprehensive system for localizing and intervening on specific 
+knowledge in Flux diffusion models. Here's how the complete workflow operates:
+
+## 1. KNOWLEDGE LOCALIZATION PHASE (localize_knowledge_and_intervene_flux.py)
+
+The localization process identifies which transformer blocks are most responsible for 
+generating specific knowledge (e.g., artistic styles, places, objects):
+
+### Step 1: Attention Contribution Measurement
+- FluxAttnContCalculatorProcessor replaces standard attention processors
+- For each training prompt containing target knowledge:
+  * Token indices of target knowledge are identified (e.g., "Van Gogh" tokens)
+  * During forward pass, attention contributions to these tokens are measured
+  * Contributions quantify how much each block influences target token generation
+
+### Step 2: Dominant Block Identification  
+- Attention contributions are aggregated across all training prompts
+- Top-k blocks with highest contributions are identified as "dominant blocks"
+- These blocks are separated into multi-modal (MM) and single transformer categories
+
+## 2. KNOWLEDGE INTERVENTION PHASE (CustomFluxPipeline.__call__)
+
+The intervention process removes or modifies target knowledge by replacing encoder
+hidden states in the identified dominant blocks:
+
+### Step 1: Dual Forward Pass Setup
+- Clean prompt: Original prompt with target knowledge removed (e.g., "A painting" vs "A Van Gogh painting")  
+- FluxEmbeddingModifierAttnProcessor replaces standard processors in dominant blocks
+
+### Step 2: Clean Pass (Save Phase)
+- Generate with clean prompt to get "knowledge-free" representations
+- Processors in SAVE_ENCODER_HIDDEN_STATES mode cache clean text embeddings
+- Clean embeddings represent what the model should generate without target knowledge
+
+### Step 3: Intervention Pass (Replace Phase) 
+- Generate with original prompt but replace encoder states in dominant blocks
+- Processors in REPLACE_ENCODER_HIDDEN_STATES mode substitute cached clean embeddings
+- This "removes" target knowledge while preserving other semantic content
+
+### Step 4: Evaluation
+- Compare generated images with/without intervention using CLIP similarity scores
+- Lower CLIP scores indicate successful knowledge removal
+- Multiple images per prompt provide robust evaluation statistics
+
+## 3. KEY TECHNICAL INNOVATIONS
+
+### Attention Contribution Calculation
+The calc_attn_cont() method computes knowledge influence as:
+```
+attention_to_knowledge * knowledge_values -> output_influence  
+contribution = L2_norm(output_influence).mean()
+```
+
+### Selective Encoder State Replacement
+Only dominant blocks get modified, preserving other knowledge and capabilities:
+```
+if block_idx in dominant_blocks:
+    encoder_states = clean_encoder_states  # Remove target knowledge
+else:
+    encoder_states = original_encoder_states  # Preserve other knowledge
+```
+
+### Multi-Modal Architecture Handling
+Flux has two types of transformer blocks:
+- Multi-modal blocks: Handle both text and image tokens
+- Single blocks: Handle only image tokens (text embedded in first 512 positions)
+
+## 4. APPLICATIONS
+
+This system enables:
+- **Style Removal**: Remove artistic styles while preserving content
+- **Safety Filtering**: Remove harmful content generation capabilities  
+- **Copyright Protection**: Prevent generation of copyrighted characters/content
+- **Bias Mitigation**: Reduce biased associations in generated content
+- **Model Analysis**: Understand knowledge organization in diffusion transformers
+
+The approach is model-agnostic and can be adapted to other transformer-based diffusion models
+beyond Flux by modifying the attention processors and pipeline integration.
+"""
